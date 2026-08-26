@@ -1,0 +1,323 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Bedrock spend enforcement — enforcement Lambda, IAM execution role, the
+  Athena-results S3 bucket, an EventBridge 15-minute trigger, and a
+  CloudWatch alarm for the IAM managed-policy size ceiling.
+
+Parameters:
+  LambdaCodeBucket:
+    Type: String
+    Description: >
+      S3 bucket holding the Lambda deployment zip. Deploy your own build
+      artifacts here before creating this stack.
+
+  LambdaZipKey:
+    Type: String
+    Description: S3 key of the Lambda deployment zip within LambdaCodeBucket.
+
+  StateDynamoTableArn:
+    Type: String
+    Description: ARN of the bedrock-spend-enforcement-state DynamoDB table
+
+  ExceptionsDynamoTableArn:
+    Type: String
+    Description: ARN of the bedrock-spend-enforcement-exceptions DynamoDB table
+
+  LogsBucket:
+    Type: String
+    Description: >
+      S3 bucket holding this account's exported Bedrock invocation logs
+      (same bucket referenced by the LogsBucket parameter in athena.yaml).
+
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: >
+      Email address to notify when the policy size ceiling is approached.
+      Leave empty to create the SNS topic without a subscription (wire it
+      manually later).
+
+  SlackBotToken:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: >
+      Slack bot token (xoxb-...) for spend threshold DMs. Leave empty to
+      disable notifications — enforcement runs normally without it.
+
+  SlackEmailDomain:
+    Type: String
+    Default: ""
+    Description: >
+      Corporate email domain used to resolve SSO usernames to Slack user
+      IDs (username@SlackEmailDomain, via users.lookupByEmail). Required
+      if SlackBotToken is set — notifier.py has no safe default to guess,
+      since every deployment's email domain differs. Leave empty if
+      SlackBotToken is also empty.
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+
+Resources:
+
+  AthenaResultsBucketResource:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub bedrock-spend-enforcement-athena-results-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-athena-results
+            Status: Enabled
+            ExpirationInDays: 7
+          - Id: abort-incomplete-multipart
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  # Logging and versioning intentionally omitted — this bucket holds only
+  # ephemeral Athena result CSVs (7-day TTL). Versioning + expiry would
+  # conflict; access logging on a temp bucket adds cost with no benefit.
+  AthenaResultsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AthenaResultsBucketResource
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyHTTP
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt AthenaResultsBucketResource.Arn
+              - !Sub ${AthenaResultsBucketResource.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: bedrock-spend-enforcement-lambda
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: bedrock-spend-enforcement-lambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Athena
+                Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                Resource: "*"
+
+              - Sid: AthenaResultsS3
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::bedrock-spend-enforcement-athena-results-${AWS::AccountId}
+                  - !Sub arn:aws:s3:::bedrock-spend-enforcement-athena-results-${AWS::AccountId}/*
+
+              - Sid: GlueReadForAthena
+                Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetPartitions
+                  - glue:GetDatabase
+                Resource: "*"
+
+              - Sid: BedrockLogsS3Read
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:aws:s3:::${LogsBucket}/*
+
+              # Athena needs bucket-level ListBucket + GetBucketLocation to
+              # enumerate partition prefixes and resolve the bucket region.
+              # Object-level /* ARNs do not cover these.
+              - Sid: BedrockLogsBucketList
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource: !Sub arn:aws:s3:::${LogsBucket}
+
+              - Sid: DynamoDB
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !Ref StateDynamoTableArn
+                  - !Ref ExceptionsDynamoTableArn
+
+              # Single-account design: the Lambda writes CMP updates directly
+              # in its own account instead of assuming a role into a separate
+              # enforcement account. Scoped to the two shared customer-managed
+              # policies the Lambda actually writes (handler.T1_POLICY_ARN /
+              # T2_POLICY_ARN) — create BedrockEnforcement-T1/-T2 in this
+              # account before deploying the Lambda.
+              - Sid: PolicyVersionManagement
+                Effect: Allow
+                Action:
+                  - iam:CreatePolicyVersion
+                  - iam:ListPolicyVersions
+                  - iam:DeletePolicyVersion
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:policy/BedrockEnforcement-T1
+                  - !Sub arn:aws:iam::${AWS::AccountId}:policy/BedrockEnforcement-T2
+
+              - Sid: OversizeMetric
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: BedrockSpendEnforcement
+                Resource: "*"
+
+  # Log group name is hardcoded (not !Sub ${EnforcementLambda}) to break the
+  # cycle: EnforcementLambda DependsOn this LogGroup, so the LogGroup cannot
+  # also reference the Lambda — same pattern as SlashCommandLogGroup in
+  # infra/slash-command.yaml. Without this, Lambda auto-creates its own log
+  # group with "Never expire" retention — unlike every other log group in
+  # this app, all of which are already set to 30 days.
+  EnforcementLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/bedrock-spend-enforcement
+      RetentionInDays: 30
+
+  EnforcementLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: EnforcementLambdaLogGroup
+    Properties:
+      FunctionName: bedrock-spend-enforcement
+      Runtime: python3.12
+      Handler: handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      # Defense-in-depth against overlapping invocations racing to write the shared
+      # T1/T2 CMPs. If a run ever takes long enough that the next 15-minute
+      # schedule fires before it finishes, EventBridge's default async retry can
+      # stack a second invocation on top of a still-running one — whichever
+      # finishes LAST wins the CMP write, not whichever had the freshest spend
+      # window, silently undoing a correct run with stale data. Capping
+      # concurrency at 1 makes that race impossible regardless of how slow a run
+      # gets; see _batch_read_items in handler.py for what keeps runs fast in
+      # the first place.
+      ReservedConcurrentExecutions: 1
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaZipKey
+      Environment:
+        Variables:
+          ATHENA_RESULTS_BUCKET: !Sub s3://bedrock-spend-enforcement-athena-results-${AWS::AccountId}/
+          STATE_TABLE: bedrock-spend-enforcement-state
+          EXCEPTIONS_TABLE: bedrock-spend-enforcement-exceptions
+          SLACK_BOT_TOKEN: !Ref SlackBotToken
+          SLACK_EMAIL_DOMAIN: !Ref SlackEmailDomain
+
+  Every15MinTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: bedrock-spend-enforcement-every-15min
+      ScheduleExpression: cron(0/15 * * * ? *)
+      State: ENABLED
+      Targets:
+        - Id: EnforcementLambda
+          Arn: !GetAtt EnforcementLambda.Arn
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EnforcementLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt Every15MinTrigger.Arn
+
+  # ── Policy size ceiling alarm ─────────────────────────────────────────────
+  # The IAM 6,144-byte cap allows ~280-300 usernames per policy. When the
+  # Lambda skips a write because the policy would be too large, enforcement
+  # silently stops for the users who should have been added. This alarm fires
+  # on the first occurrence so it surfaces before engineers start bypassing
+  # the cap.
+
+  PolicySizeAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: bedrock-spend-enforcement-policy-size-alarm
+      KmsMasterKeyId: alias/aws/sns
+
+  PolicySizeAlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref PolicySizeAlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  # The Lambda emits the PolicySizeOverflow metric (namespace
+  # BedrockSpendEnforcement, dimension Tier) directly via put_metric_data on
+  # the skip path — more reliable than matching a log string. The alarm
+  # fires on the first occurrence.
+  PolicySizeCeilingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: bedrock-spend-enforcement-policy-size-ceiling
+      AlarmDescription: >
+        Lambda skipped a CMP write because the policy document exceeded the
+        IAM 6144-byte limit. Enforcement is silently incomplete for users who
+        should have been denied. Investigate and split the policy or reduce
+        the username list.
+      Namespace: BedrockSpendEnforcement
+      MetricName: PolicySizeOverflow
+      Statistic: Sum
+      # 900s (15 min) aligns the alarm window with the enforcement cadence so an
+      # overflow surfaces within one run rather than up to an hour later.
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref PolicySizeAlarmTopic
+
+Outputs:
+  LambdaArn:
+    Value: !GetAtt EnforcementLambda.Arn
+  LambdaExecutionRoleArn:
+    Value: !GetAtt LambdaExecutionRole.Arn
+  AthenaResultsBucketName:
+    Value: !Ref AthenaResultsBucketResource
+    Description: Pass this bucket name as the AthenaResultsBucket parameter to athena.yaml
+  PolicySizeAlarmTopicArn:
+    Value: !Ref PolicySizeAlarmTopic
+    Description: SNS topic for policy size ceiling alerts — subscribe additional endpoints here

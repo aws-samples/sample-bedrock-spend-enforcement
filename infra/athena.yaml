@@ -1,0 +1,426 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Bedrock spend enforcement — Glue table and Athena view.
+
+  Manages:
+    - bedrocklogs_metadata_clean  (source Glue table over exported Bedrock
+                                    invocation logs, in this account)
+    - default.bedrock_cost_today  (Athena view: per-user usage and estimated
+                                    cost over a rolling ~24h window)
+
+  The view's SQL is embedded below (CloudFormation can't include an external
+  file inline). sql/bedrock_cost_today.sql carries the identical query as a
+  read-only, easier-to-review reference — keep both in sync and bump
+  ViewVersion below if you change either.
+
+Parameters:
+  AthenaResultsBucket:
+    Type: String
+    Description: >
+      S3 bucket for Athena query results (created by the lambda stack).
+      S3 bucket names are globally unique, so name it with the account ID
+      baked in via a pseudo-parameter, e.g. bedrock-spend-enforcement-athena-results
+      followed by the account ID (using an Fn::Sub with the AccountId
+      pseudo parameter).
+
+  LogsBucket:
+    Type: String
+    Description: >
+      S3 bucket holding this account's exported Bedrock invocation logs
+      (model invocation logging to S3, under
+      BedrockMetadataClean/AWSLogs/<account-id>/BedrockModelInvocationLogs/<region>/...).
+
+Resources:
+
+  # ── Glue source table ─────────────────────────────────────────────────────
+  # AWS::Glue::Table has no Tags property in CloudFormation — this table
+  # cannot carry the required cloud tagging standard tags. Known, accepted
+  # gap (no CFN-native workaround short of a custom resource).
+
+  LogsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: default
+      TableInput:
+        Name: bedrocklogs_metadata_clean
+        Description: "Bedrock invocation metadata (no prompt bodies) — input/output token counts only"
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          projection.enabled: "true"
+          projection.datehour.type: date
+          projection.datehour.range: "2025/01/01/00,NOW"
+          projection.datehour.format: "yyyy/MM/dd/HH"
+          projection.datehour.interval: "1"
+          projection.datehour.interval.unit: HOURS
+          classification: json
+          storage.location.template: !Sub "s3://${LogsBucket}/BedrockMetadataClean/AWSLogs/${AWS::AccountId}/BedrockModelInvocationLogs/${AWS::Region}/${!datehour}/"
+        StorageDescriptor:
+          Location: !Sub "s3://${LogsBucket}/BedrockMetadataClean/AWSLogs/${AWS::AccountId}/BedrockModelInvocationLogs/${AWS::Region}/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters:
+              serialization.format: "1"
+              ignore.malformed.json: "true"
+              case.insensitive: "true"
+          Columns:
+            - Name: schematype
+              Type: string
+            - Name: timestamp
+              Type: string
+            - Name: accountid
+              Type: string
+            - Name: identity
+              Type: "struct<arn:string>"
+            - Name: region
+              Type: string
+            - Name: requestid
+              Type: string
+            - Name: operation
+              Type: string
+            - Name: modelid
+              Type: string
+            - Name: inferenceregion
+              Type: string
+            - Name: input
+              Type: "struct<inputTokenCount:bigint,cacheReadInputTokenCount:bigint,cacheWriteInputTokenCount:bigint>"
+            - Name: output
+              Type: "struct<outputTokenCount:bigint>"
+        PartitionKeys:
+          - Name: datehour
+            Type: string
+
+  # ── Athena view (Custom Resource) ─────────────────────────────────────────
+  # CloudFormation has no native resource type for Athena views. A small
+  # inline Lambda runs CREATE OR REPLACE VIEW on Create/Update and
+  # DROP VIEW IF EXISTS on Delete.
+
+  ViewManagerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/bedrock-spend-enforcement-view-manager
+      RetentionInDays: 30
+
+  ViewManagerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: bedrock-spend-enforcement-view-manager
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: run-athena-ddl
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # athena:StartQueryExecution and athena:GetQueryExecution do not
+              # support resource-level ARNs — Resource:* is required by the API.
+              - Sid: Athena
+                Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                Resource: "*"
+              - Sid: AthenaResultsS3
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${AthenaResultsBucket}"
+                  - !Sub "arn:aws:s3:::${AthenaResultsBucket}/*"
+              # Athena stores view definitions as Glue catalog objects (TableType:
+              # VIRTUAL_VIEW). CREATE OR REPLACE VIEW requires CreateTable (first run)
+              # and UpdateTable (subsequent); DROP VIEW requires DeleteTable.
+              # Scoped to the catalog, default database, and the source table
+              # plus the view itself.
+              - Sid: GlueReadWrite
+                Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetDatabase
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:DeleteTable
+                Resource:
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/default"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/default/bedrocklogs_metadata_clean"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/default/bedrock_cost_today"
+
+  ViewManagerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - LogsTable
+      - ViewManagerLogGroup
+    Properties:
+      FunctionName: bedrock-spend-enforcement-view-manager
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ViewManagerRole.Arn
+      # 300s: the poll loop runs up to 40x2s=80s; the remaining 220s covers
+      # cold start, StartQueryExecution, and the _send callback to CloudFormation.
+      # A 120s timeout would race with the poll loop and get SIGKILL'd before
+      # _send fires, leaving CloudFormation hanging for up to 1 hour.
+      Timeout: 300
+      Environment:
+        Variables:
+          ATHENA_RESULTS_BUCKET: !Sub "s3://${AthenaResultsBucket}/view-manager/"
+      Code:
+        ZipFile: |
+          import boto3, json, os, time, traceback, urllib.request
+          import botocore.exceptions
+
+          CREATE_VIEW_SQL = """
+          CREATE OR REPLACE VIEW default.bedrock_cost_today AS
+          WITH
+            bounds AS (
+              SELECT
+                (date_trunc('day', (current_timestamp AT TIME ZONE 'UTC' - INTERVAL '4' HOUR)) + INTERVAL '4' HOUR)  AS window_start,
+                (date_trunc('day', (current_timestamp AT TIME ZONE 'UTC' - INTERVAL '4' HOUR)) + INTERVAL '28' HOUR) AS window_end
+            ),
+            raw_logs AS (
+              SELECT datehour, identity, modelId, operation, input, output
+              FROM default.bedrocklogs_metadata_clean CROSS JOIN bounds
+              WHERE operation IN ('InvokeModel','InvokeModelWithResponseStream','Converse','ConverseStream')
+                AND datehour >= date_format(window_start, '%Y/%m/%d/%H')
+                AND datehour <  date_format(window_end,   '%Y/%m/%d/%H')
+            ),
+            raw AS (
+              SELECT
+                CAST(DATE_TRUNC('day', DATE_PARSE(datehour, '%Y/%m/%d/%H')) AS DATE) AS day,
+                datehour,
+                identity.arn AS arn,
+                REPLACE(REGEXP_EXTRACT(identity.arn, '/([^/]+)$'), '/', '') AS person,
+                modelId AS raw_model, operation,
+                CASE
+                  WHEN modelId LIKE '%fable-5%' OR modelId LIKE '%fable5%' THEN 'Fable 5'
+                  WHEN modelId LIKE '%opus-5%'            THEN 'Opus 5'
+                  WHEN modelId LIKE '%sonnet-5%'          THEN 'Sonnet 5'
+                  WHEN modelId LIKE '%opus-4-8%'          THEN 'Opus 4.8'
+                  WHEN modelId LIKE '%opus-4-7%'          THEN 'Opus 4.7'
+                  WHEN modelId LIKE '%opus-4-6%'          THEN 'Opus 4.6'
+                  WHEN modelId LIKE '%opus-4-5%'          THEN 'Opus 4.5'
+                  WHEN modelId LIKE '%opus-4-1%'          THEN 'Opus 4.1'
+                  WHEN modelId LIKE '%opus-4-20250514%'   THEN 'Opus 4'
+                  WHEN modelId LIKE '%sonnet-4-6%'        THEN 'Sonnet 4.6'
+                  WHEN modelId LIKE '%sonnet-4-5-20250929%' THEN 'Sonnet 4.5'
+                  WHEN modelId LIKE '%sonnet-4-20250514%' THEN 'Sonnet 4'
+                  WHEN modelId LIKE '%haiku-4-5%'         THEN 'Haiku 4.5'
+                  WHEN modelId LIKE '%3-7-sonnet%' OR modelId LIKE '%claude-3.7-sonnet%' THEN 'Sonnet 3.7'
+                  WHEN modelId LIKE '%3-5-sonnet%' OR modelId LIKE '%sonnet-3-5%' OR modelId LIKE '%sonnet-v2%' THEN 'Sonnet 3.5'
+                  WHEN modelId LIKE '%3-5-haiku%'  OR modelId LIKE '%3.5-haiku%'  OR modelId LIKE '%haiku-20241022%' THEN 'Haiku 3.5'
+                  WHEN modelId LIKE '%3-sonnet-20240229%' OR modelId LIKE '%sonnet-20240229%' THEN 'Sonnet 3'
+                  WHEN modelId LIKE '%3-opus-20240229%'   OR modelId LIKE '%opus-20240229%'   THEN 'Opus 3'
+                  WHEN modelId LIKE '%3-haiku-20240307%'  OR modelId LIKE '%haiku-20240307%'  THEN 'Haiku 3'
+                  WHEN modelId LIKE '%titan-embed-text-v2%' THEN 'Titan Embed v2'
+                  WHEN modelId LIKE '%titan-embed%'       THEN 'Titan Embed'
+                  WHEN modelId LIKE '%llama-3-3-70b%'     THEN 'Llama 3.3 70B'
+                  WHEN modelId LIKE '%llama-3-2-3b%'      THEN 'Llama 3.2 3B'
+                  WHEN modelId LIKE '%llama-3-2-1b%'      THEN 'Llama 3.2 1B'
+                  WHEN modelId LIKE '%llama-3-1-70b%'     THEN 'Llama 3.1 70B'
+                  WHEN modelId LIKE '%llama-3-1-8b%'      THEN 'Llama 3.1 8B'
+                  WHEN modelId LIKE '%nova-2-lite%'       THEN 'Nova 2 Lite'
+                  WHEN modelId LIKE '%nova-pro%'          THEN 'Nova Pro'
+                  WHEN modelId LIKE '%nova-lite%'         THEN 'Nova Lite'
+                  WHEN modelId LIKE '%nova-micro%'        THEN 'Nova Micro'
+                  WHEN modelId LIKE '%cohere%'            THEN 'Cohere'
+                  WHEN modelId LIKE '%deepseek%'          THEN 'DeepSeek'
+                  ELSE 'Unknown'
+                END AS model,
+                COALESCE(input.inputTokenCount,           0) AS uncached_input_tokens,
+                COALESCE(input.cacheReadInputTokenCount,  0) AS cache_read_tokens,
+                COALESCE(input.cacheWriteInputTokenCount, 0) AS cache_write_tokens,
+                COALESCE(output.outputTokenCount,         0) AS output_tokens,
+                CASE WHEN modelId LIKE '%/global.%' OR modelId LIKE 'global.%' THEN 'global' ELSE 'geo' END AS endpoint_type,
+                CASE
+                  WHEN LOWER(REPLACE(REGEXP_EXTRACT(identity.arn, '/([^/]+)$'), '/', '')) LIKE '%service%'    THEN 'non-human'
+                  WHEN LOWER(REPLACE(REGEXP_EXTRACT(identity.arn, '/([^/]+)$'), '/', '')) LIKE '%lambda%'     THEN 'non-human'
+                  WHEN LOWER(REPLACE(REGEXP_EXTRACT(identity.arn, '/([^/]+)$'), '/', '')) LIKE '%bot%'        THEN 'non-human'
+                  WHEN LOWER(REPLACE(REGEXP_EXTRACT(identity.arn, '/([^/]+)$'), '/', '')) LIKE '%automation%' THEN 'non-human'
+                  WHEN LOWER(REPLACE(REGEXP_EXTRACT(identity.arn, '/([^/]+)$'), '/', '')) LIKE '%system%'     THEN 'non-human'
+                  WHEN LOWER(REPLACE(REGEXP_EXTRACT(identity.arn, '/([^/]+)$'), '/', '')) LIKE '%app%'        THEN 'non-human'
+                  WHEN LOWER(REPLACE(REGEXP_EXTRACT(identity.arn, '/([^/]+)$'), '/', '')) LIKE '%api%'        THEN 'non-human'
+                  WHEN LOWER(REPLACE(REGEXP_EXTRACT(identity.arn, '/([^/]+)$'), '/', '')) LIKE '%pipeline%'   THEN 'non-human'
+                  WHEN LOWER(REPLACE(REGEXP_EXTRACT(identity.arn, '/([^/]+)$'), '/', '')) LIKE '%deploy%'     THEN 'non-human'
+                  WHEN LOWER(REPLACE(REGEXP_EXTRACT(identity.arn, '/([^/]+)$'), '/', '')) LIKE '%build%'      THEN 'non-human'
+                  WHEN LOWER(REPLACE(REGEXP_EXTRACT(identity.arn, '/([^/]+)$'), '/', '')) LIKE '%ci-%'        THEN 'non-human'
+                  WHEN LOWER(REPLACE(REGEXP_EXTRACT(identity.arn, '/([^/]+)$'), '/', '')) LIKE '%cd-%'        THEN 'non-human'
+                  WHEN LOWER(REPLACE(REGEXP_EXTRACT(identity.arn, '/([^/]+)$'), '/', '')) LIKE '%worker%'     THEN 'non-human'
+                  WHEN LOWER(REPLACE(REGEXP_EXTRACT(identity.arn, '/([^/]+)$'), '/', '')) LIKE '%job%'        THEN 'non-human'
+                  WHEN LOWER(REPLACE(REGEXP_EXTRACT(identity.arn, '/([^/]+)$'), '/', '')) LIKE '%scheduled%'  THEN 'non-human'
+                  WHEN LOWER(REPLACE(REGEXP_EXTRACT(identity.arn, '/([^/]+)$'), '/', '')) LIKE '%cron%'       THEN 'non-human'
+                  WHEN LOWER(REPLACE(REGEXP_EXTRACT(identity.arn, '/([^/]+)$'), '/', '')) LIKE 'claude-xtm-%' THEN 'non-human'
+                  ELSE 'human'
+                END AS usage_type
+              FROM raw_logs
+            )
+          SELECT
+            day, arn, person, raw_model, model, operation,
+            endpoint_type, usage_type,
+            uncached_input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
+            (uncached_input_tokens + cache_read_tokens + cache_write_tokens) AS total_input_tokens,
+            (
+              CASE model
+                WHEN 'Fable 5'        THEN ((uncached_input_tokens*1E1)+(output_tokens*5E1)+(cache_write_tokens*1.25E1)+(cache_read_tokens*1E0))
+                WHEN 'Opus 5'         THEN ((uncached_input_tokens*5E0)+(output_tokens*2.5E1)+(cache_write_tokens*6.25E0)+(cache_read_tokens*5E-1))
+                WHEN 'Sonnet 5'       THEN ((uncached_input_tokens*2E0)+(output_tokens*1E1)+(cache_write_tokens*2.5E0)+(cache_read_tokens*2E-1))
+                WHEN 'Opus 4.8'       THEN ((uncached_input_tokens*5E0)+(output_tokens*2.5E1)+(cache_write_tokens*6.25E0)+(cache_read_tokens*5E-1))
+                WHEN 'Opus 4.7'       THEN ((uncached_input_tokens*5E0)+(output_tokens*2.5E1)+(cache_write_tokens*6.25E0)+(cache_read_tokens*5E-1))
+                WHEN 'Opus 4.6'       THEN ((uncached_input_tokens*5E0)+(output_tokens*2.5E1)+(cache_write_tokens*6.25E0)+(cache_read_tokens*5E-1))
+                WHEN 'Opus 4.5'       THEN ((uncached_input_tokens*5E0)+(output_tokens*2.5E1)+(cache_write_tokens*6.25E0)+(cache_read_tokens*5E-1))
+                WHEN 'Opus 4.1'       THEN ((uncached_input_tokens*1.5E1)+(output_tokens*7.5E1)+(cache_write_tokens*1.875E1)+(cache_read_tokens*1.5E0))
+                WHEN 'Opus 4'         THEN ((uncached_input_tokens*1.5E1)+(output_tokens*7.5E1)+(cache_write_tokens*1.875E1)+(cache_read_tokens*1.5E0))
+                WHEN 'Opus 3'         THEN ((uncached_input_tokens*1.5E1)+(output_tokens*7.5E1)+(cache_write_tokens*1.875E1)+(cache_read_tokens*1.5E0))
+                WHEN 'Sonnet 4.6'     THEN ((uncached_input_tokens*3E0)+(output_tokens*1.5E1)+(cache_write_tokens*3.75E0)+(cache_read_tokens*3E-1))
+                WHEN 'Sonnet 4.5'     THEN ((uncached_input_tokens*3E0)+(output_tokens*1.5E1)+(cache_write_tokens*3.75E0)+(cache_read_tokens*3E-1))
+                WHEN 'Sonnet 4'       THEN ((uncached_input_tokens*3E0)+(output_tokens*1.5E1)+(cache_write_tokens*3.75E0)+(cache_read_tokens*3E-1))
+                WHEN 'Sonnet 3.7'     THEN ((uncached_input_tokens*3E0)+(output_tokens*1.5E1)+(cache_write_tokens*3.75E0)+(cache_read_tokens*3E-1))
+                WHEN 'Sonnet 3.5'     THEN ((uncached_input_tokens*3E0)+(output_tokens*1.5E1)+(cache_write_tokens*3.75E0)+(cache_read_tokens*3E-1))
+                WHEN 'Sonnet 3'       THEN ((uncached_input_tokens*3E0)+(output_tokens*1.5E1)+(cache_write_tokens*3.75E0)+(cache_read_tokens*3E-1))
+                WHEN 'Haiku 4.5'      THEN ((uncached_input_tokens*1E0)+(output_tokens*5E0)+(cache_write_tokens*1.25E0)+(cache_read_tokens*1E-1))
+                WHEN 'Haiku 3.5'      THEN ((uncached_input_tokens*8E-1)+(output_tokens*4E0)+(cache_write_tokens*1E0)+(cache_read_tokens*8E-2))
+                WHEN 'Haiku 3'        THEN ((uncached_input_tokens*2.5E-1)+(output_tokens*1.25E0)+(cache_write_tokens*3E-1)+(cache_read_tokens*3E-2))
+                WHEN 'Titan Embed v2' THEN (uncached_input_tokens*2E-2)
+                WHEN 'Titan Embed'    THEN (uncached_input_tokens*2E-2)
+                WHEN 'Llama 3.3 70B'  THEN ((uncached_input_tokens*7.2E-1)+(output_tokens*7.2E-1))
+                WHEN 'Llama 3.2 3B'   THEN ((uncached_input_tokens*1.5E-1)+(output_tokens*1.5E-1))
+                WHEN 'Llama 3.2 1B'   THEN ((uncached_input_tokens*1E-1)+(output_tokens*1E-1))
+                WHEN 'Llama 3.1 70B'  THEN ((uncached_input_tokens*7.2E-1)+(output_tokens*7.2E-1))
+                WHEN 'Llama 3.1 8B'   THEN ((uncached_input_tokens*2.2E-1)+(output_tokens*2.2E-1))
+                WHEN 'Nova 2 Lite'    THEN ((uncached_input_tokens*3E-1)+(output_tokens*2.5E0))
+                WHEN 'Nova Pro'       THEN ((uncached_input_tokens*8E-1)+(output_tokens*3.2E0))
+                WHEN 'Nova Lite'      THEN ((uncached_input_tokens*6E-2)+(output_tokens*2.4E-1))
+                WHEN 'Nova Micro'     THEN ((uncached_input_tokens*3.5E-2)+(output_tokens*1.4E-1))
+                -- Unpriced/unmapped model: fall back to the highest-priced tier
+                -- (Opus 4-generation rate) rather than $0. Enforcement must fail
+                -- safe — a $0 estimate lets an unmapped model bypass spend limits
+                -- entirely. handler.py alerts (UnmappedModelSpend metric) whenever
+                -- it sees model='Unknown' rows so the real rate gets added promptly.
+                ELSE ((uncached_input_tokens*1.5E1)+(output_tokens*7.5E1)+(cache_write_tokens*1.875E1)+(cache_read_tokens*1.5E0))
+              END / 1E6
+            ) * CASE
+              -- 1.1x geo surcharge applies only to newer cross-region inference
+              -- profile models (Opus 4.5+, Sonnet 4.5+, Haiku 4.5, Fable 5, Sonnet 5, Opus 5,
+              -- Nova 2 Lite). Older generations (Opus 4.1 and below, Sonnet 4 and below, Nova
+              -- Lite/Pro/Micro v1, etc.) are not routed through geo-priced inference profiles
+              -- in this account.
+              WHEN endpoint_type = 'geo'
+                AND model IN ('Opus 4.5','Opus 4.6','Opus 4.7','Opus 4.8','Opus 5','Fable 5','Sonnet 4.5','Sonnet 4.6','Sonnet 5','Haiku 4.5','Nova 2 Lite')
+              THEN 1.1E0
+              ELSE 1E0
+            END AS estimated_cost
+          FROM raw
+          """
+
+          DROP_VIEW_SQL = "DROP VIEW IF EXISTS default.bedrock_cost_today"
+
+
+          def _run_athena(sql):
+              client = boto3.client("athena")
+              resp = client.start_query_execution(
+                  QueryString=sql,
+                  QueryExecutionContext={"Database": "default"},
+                  ResultConfiguration={"OutputLocation": os.environ["ATHENA_RESULTS_BUCKET"]},
+                  WorkGroup="primary",
+              )
+              qid = resp["QueryExecutionId"]
+              # DDL queries are typically sub-second; wait briefly before first poll.
+              time.sleep(1)
+              # 40 iterations x 2s = 80s max poll. With Timeout:300, this leaves
+              # 220s for cold start, StartQueryExecution, and the _send callback.
+              for _ in range(40):
+                  execution = client.get_query_execution(QueryExecutionId=qid)["QueryExecution"]
+                  state = execution["Status"]["State"]
+                  if state == "SUCCEEDED":
+                      return
+                  if state in ("FAILED", "CANCELLED"):
+                      reason = execution["Status"].get("StateChangeReason", "unknown")
+                      raise RuntimeError(f"Athena query {state}: {reason}")
+                  if state not in ("RUNNING", "QUEUED"):
+                      raise RuntimeError(f"Athena query in unexpected state {state!r}: {qid}")
+                  time.sleep(2)
+              raise RuntimeError(f"Athena query timed out after polling: {qid}")
+
+
+          def _send(url, body):
+              data = json.dumps(body).encode()
+              # Explicit Content-Length prevents urllib from using chunked transfer
+              # encoding, which S3 pre-signed URLs reject with 400/501. method="PUT"
+              # is required because CFN signs the response URL for PUT specifically —
+              # urllib defaults to POST whenever `data` is set, which S3 rejects with
+              # 403 (signature does not match) since the signed method doesn't match.
+              req = urllib.request.Request(
+                  url, data=data, method="PUT",
+                  headers={"Content-Type": "", "Content-Length": str(len(data))},
+              )
+              try:
+                  urllib.request.urlopen(req, timeout=10)
+              except Exception as exc:
+                  print(f"CRITICAL: failed to deliver CFN response to pre-signed URL: {exc}")
+                  raise
+
+
+          def handler(event, context):
+              request_type = event["RequestType"]
+              response_url  = event["ResponseURL"]
+              physical_id   = "bedrock-cost-today-view"
+              status = "SUCCESS"
+              reason = ""
+              try:
+                  if request_type in ("Create", "Update"):
+                      _run_athena(CREATE_VIEW_SQL)
+                  elif request_type == "Delete":
+                      _run_athena(DROP_VIEW_SQL)
+                  else:
+                      raise ValueError(f"Unrecognised RequestType: {request_type!r}")
+              except botocore.exceptions.ClientError as exc:
+                  status = "FAILED"
+                  reason = f"AWS API error (check IAM / Athena workgroup / S3 bucket): {exc}"
+                  print(f"ERROR: {reason}\n{traceback.format_exc()}")
+              except RuntimeError as exc:
+                  status = "FAILED"
+                  reason = str(exc)
+                  print(f"ERROR: Athena DDL failed: {exc}")
+              except Exception as exc:
+                  status = "FAILED"
+                  reason = f"Unexpected error: {exc}"
+                  print(f"ERROR: unexpected exception:\n{traceback.format_exc()}")
+              print(f"Sending CFN response: status={status} reason={reason!r}")
+              _send(response_url, {
+                  "Status": status,
+                  "Reason": reason,
+                  "PhysicalResourceId": physical_id,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+              })
+
+  BedrocKCostTodayView:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - LogsTable
+    Properties:
+      ServiceToken: !GetAtt ViewManagerFunction.Arn
+      # Bump this string whenever the view SQL changes to force re-execution on update.
+      ViewVersion: "1"
+
+Outputs:
+  LogsTableName:
+    Value: !Ref LogsTable
+    Description: Glue table name for Bedrock invocation logs
+  ViewManagerFunctionArn:
+    Value: !GetAtt ViewManagerFunction.Arn
+    Description: Lambda that manages the bedrock_cost_today Athena view

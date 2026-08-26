@@ -1,0 +1,256 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Bedrock spend enforcement slash commands — Lambda + API Gateway HTTP API.
+  Routes: POST /bedrock-spend, POST /bedrock-block, POST /bedrock-unblock,
+          POST /bedrock-limit, POST /bedrock-interact (button callbacks)
+
+Parameters:
+  LambdaCodeBucket:
+    Type: String
+    Description: >
+      S3 bucket holding the Lambda deployment zip (same bucket used by
+      lambda.yaml's LambdaCodeBucket parameter).
+
+  LambdaZipKey:
+    Type: String
+    Description: S3 key of the Lambda deployment zip (same zip as the enforcement Lambda)
+
+  SlackBotToken:
+    Type: String
+    NoEcho: true
+    Description: >
+      Slack bot token (xoxb-...). Store securely and pass as a stack
+      parameter at deploy time.
+
+  SlackSigningSecret:
+    Type: String
+    NoEcho: true
+    Description: >
+      Slack signing secret for HMAC verification. Store securely and pass
+      as a stack parameter at deploy time.
+
+  AdminSlackIds:
+    Type: String
+    Default: ""
+    Description: >
+      Comma-separated Slack user IDs allowed to use admin commands
+      (/bedrock-block, /bedrock-unblock, /bedrock-limit).
+
+  SlackEmailDomain:
+    Type: String
+    Default: ""
+    Description: >
+      Corporate email domain used to resolve SSO usernames to Slack user
+      IDs (username@SlackEmailDomain, via users.lookupByEmail). Required
+      for /bedrock-spend's spend lookup — notifier.py has no safe default
+      to guess, since every deployment's email domain differs.
+
+  StateDynamoTableArn:
+    Type: String
+    Description: ARN of the bedrock-spend-enforcement-state DynamoDB table
+
+  ExceptionsDynamoTableArn:
+    Type: String
+    Description: ARN of the bedrock-spend-enforcement-exceptions DynamoDB table
+
+Resources:
+
+  SlashCommandRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: bedrock-spend-enforcement-slash-command
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: slash-command-permissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DynamoRead
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                Resource:
+                  - !Ref StateDynamoTableArn
+                  - !Ref ExceptionsDynamoTableArn
+              - Sid: DynamoWrite
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !Ref ExceptionsDynamoTableArn
+              - Sid: SelfInvoke
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:bedrock-spend-enforcement-slash-command
+              - Sid: InvokeEnforcement
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:bedrock-spend-enforcement
+
+  SlashCommandLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: SlashCommandLogGroup
+    Properties:
+      FunctionName: bedrock-spend-enforcement-slash-command
+      Runtime: python3.12
+      Handler: slash_command.lambda_handler
+      Role: !GetAtt SlashCommandRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaZipKey
+      Environment:
+        Variables:
+          SLACK_BOT_TOKEN: !Ref SlackBotToken
+          SLACK_SIGNING_SECRET: !Ref SlackSigningSecret
+          STATE_TABLE: bedrock-spend-enforcement-state
+          EXCEPTIONS_TABLE: bedrock-spend-enforcement-exceptions
+          ADMIN_SLACK_IDS: !Ref AdminSlackIds
+          ENFORCEMENT_FUNCTION_NAME: bedrock-spend-enforcement
+          SLACK_EMAIL_DOMAIN: !Ref SlackEmailDomain
+
+  # Published version + alias exist so Slack's gateway invocation can target
+  # a warm, provisioned-concurrency environment instead of $LATEST (which
+  # cold-starts on every deploy and intermittently blows Slack's 3-second ACK
+  # window — hence "operation_timeout" while the command still completes via
+  # the async self-invoke leg below). Description is set to LambdaZipKey (the
+  # deploy's git sha) purely to force CloudFormation to publish a new Version
+  # on every code change — AWS::Lambda::Version has no in-place update.
+  SlashCommandVersion:
+    Type: AWS::Lambda::Version
+    # Lambda versions are immutable, so a LambdaZipKey change replaces this
+    # resource (create new → update alias → delete old). Retain so CF never
+    # deletes a version — otherwise a rollback can get stuck: the alias
+    # reverts to the old version, then CF tries to delete that same version.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      FunctionName: !Ref SlashCommandLambda
+      Description: !Ref LambdaZipKey
+
+  SlashCommandAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref SlashCommandLambda
+      Name: live
+      FunctionVersion: !GetAtt SlashCommandVersion.Version
+      ProvisionedConcurrencyConfig:
+        ProvisionedConcurrentExecutions: 1
+
+  SlashCommandApi:
+    Type: AWS::ApiGatewayV2::Api
+    DependsOn: SlashCommandApiLogGroup
+    Properties:
+      Name: bedrock-spend-enforcement-slash-command
+      ProtocolType: HTTP
+
+  SlashCommandIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref SlashCommandApi
+      IntegrationType: AWS_PROXY
+      # Points at the "live" alias (not $LATEST) so requests land on the
+      # provisioned-concurrency-warmed environment above.
+      IntegrationUri: !Ref SlashCommandAlias
+      PayloadFormatVersion: "2.0"
+
+  SlashCommandRouteSpend:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref SlashCommandApi
+      RouteKey: POST /bedrock-spend
+      Target: !Sub integrations/${SlashCommandIntegration}
+
+  SlashCommandRouteBlock:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref SlashCommandApi
+      RouteKey: POST /bedrock-block
+      Target: !Sub integrations/${SlashCommandIntegration}
+
+  SlashCommandRouteUnblock:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref SlashCommandApi
+      RouteKey: POST /bedrock-unblock
+      Target: !Sub integrations/${SlashCommandIntegration}
+
+  SlashCommandRouteLimit:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref SlashCommandApi
+      RouteKey: POST /bedrock-limit
+      Target: !Sub integrations/${SlashCommandIntegration}
+
+  # Button callback route — Slack posts here when user clicks confirm/cancel
+  SlashCommandRouteInteract:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref SlashCommandApi
+      RouteKey: POST /bedrock-interact
+      Target: !Sub integrations/${SlashCommandIntegration}
+
+  # Log group name is hardcoded (not !Sub ${SlashCommandLambda}) to break the
+  # cycle: SlashCommandLambda DependsOn this LogGroup, so the LogGroup cannot
+  # also reference the Lambda. The function name is fixed above, so this stays
+  # in sync as long as the function name doesn't change.
+  SlashCommandLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/bedrock-spend-enforcement-slash-command
+      RetentionInDays: 30
+
+  SlashCommandApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/apigateway/bedrock-spend-enforcement-slash-command
+      RetentionInDays: 30
+
+  SlashCommandStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref SlashCommandApi
+      StageName: $default
+      AutoDeploy: true
+      AccessLogSettings:
+        DestinationArn: !GetAtt SlashCommandApiLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","routeKey":"$context.routeKey","status":"$context.status","responseLength":"$context.responseLength","integrationError":"$context.integrationErrorMessage"}'
+
+  SlashCommandApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      # Grants invoke on the alias-qualified ARN, matching what API Gateway
+      # now calls via SlashCommandIntegration above.
+      FunctionName: !Ref SlashCommandAlias
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SlashCommandApi}/*/*
+
+Outputs:
+  SlashCommandSpendUrl:
+    Value: !Sub https://${SlashCommandApi}.execute-api.${AWS::Region}.amazonaws.com/bedrock-spend
+    Description: Paste into Slack /bedrock-spend slash command Request URL
+  SlashCommandBlockUrl:
+    Value: !Sub https://${SlashCommandApi}.execute-api.${AWS::Region}.amazonaws.com/bedrock-block
+    Description: Paste into Slack /bedrock-block slash command Request URL
+  SlashCommandUnblockUrl:
+    Value: !Sub https://${SlashCommandApi}.execute-api.${AWS::Region}.amazonaws.com/bedrock-unblock
+    Description: Paste into Slack /bedrock-unblock slash command Request URL
+  SlashCommandLimitUrl:
+    Value: !Sub https://${SlashCommandApi}.execute-api.${AWS::Region}.amazonaws.com/bedrock-limit
+    Description: Paste into Slack /bedrock-limit slash command Request URL
+  InteractUrl:
+    Value: !Sub https://${SlashCommandApi}.execute-api.${AWS::Region}.amazonaws.com/bedrock-interact
+    Description: Paste into Slack app Interactivity Request URL (api.slack.com/apps → Interactivity)
