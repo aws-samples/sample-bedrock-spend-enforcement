@@ -1,0 +1,5 @@
+ignore_checks:
+  # bedrock:Converse and bedrock:ConverseStream are real IAM actions used in
+  # the enforcement CMPs. cfn-lint's bundled Bedrock IAM schema is stale and
+  # doesn't list them yet.
+  - W3037

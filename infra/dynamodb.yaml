@@ -1,0 +1,39 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  DynamoDB tables for Bedrock spend enforcement: per-user spend state
+  (StateTable) and manually-managed spend-limit exceptions (ExceptionsTable).
+
+Resources:
+  StateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: bedrock-spend-enforcement-state
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+
+  ExceptionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: bedrock-spend-enforcement-exceptions
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+
+Outputs:
+  StateTableArn:
+    Value: !GetAtt StateTable.Arn
+    Description: Pass this ARN as a parameter to the lambda stack (StateDynamoTableArn)
+  ExceptionsTableArn:
+    Value: !GetAtt ExceptionsTable.Arn
+    Description: Pass this ARN as a parameter to the lambda stack (ExceptionsDynamoTableArn)

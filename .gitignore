@@ -1,0 +1,6 @@
+.worktrees/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+lambda.zip
