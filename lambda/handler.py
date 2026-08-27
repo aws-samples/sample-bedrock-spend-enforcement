@@ -163,9 +163,9 @@ def _wait_for_athena_query(client: _AthenaQueryClient, execution_id: str) -> Non
         if state in ("FAILED", "CANCELLED"):
             reason = status["QueryExecution"]["Status"].get("StateChangeReason", "unknown")
             raise RuntimeError(f"Athena query {state}: {reason}")
-        # nosemgrep: arbitrary-sleep -- intentional fixed poll interval for Athena's
-        # asynchronous query model; the loop exits on SUCCEEDED/FAILED/CANCELLED above.
-        time.sleep(2)
+        # Intentional fixed poll interval for Athena's asynchronous query model;
+        # the loop exits on SUCCEEDED/FAILED/CANCELLED above.
+        time.sleep(2)  # nosemgrep: arbitrary-sleep
 
 
 _COST_VIEW_GROUP_COLUMNS = ["person", "model", "raw_model", "usage_type", "arn"]
