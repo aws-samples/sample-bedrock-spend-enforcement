@@ -159,12 +159,8 @@ def _post_ephemeral_api(channel_id: str, user_id: str, text: str) -> None:
     """
     token = os.environ.get("SLACK_BOT_TOKEN", "")
     if not token:
-        logger.error(
-            # nosemgrep: python-logger-credential-disclosure -- static message about a MISSING token; logs only channel_id/user_id, never a secret value
-            "Slack bot token not configured — ephemeral delivery skipped channel=%s user=%s",  # nosemgrep: python-logger-credential-disclosure
-            channel_id,
-            user_id,
-        )
+        # Static message about a MISSING token; logs only channel_id/user_id, never a secret value.
+        logger.error("Slack bot token not configured — ephemeral delivery skipped channel=%s user=%s", channel_id, user_id)  # nosemgrep
         return
     try:
         WebClient(token=token).chat_postEphemeral(channel=channel_id, user=user_id, text=text)
