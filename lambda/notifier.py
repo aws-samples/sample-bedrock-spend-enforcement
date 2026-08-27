@@ -25,47 +25,47 @@ SLACK_EMAIL_DOMAIN = os.environ["SLACK_EMAIL_DOMAIN"]
 _WARN_MESSAGES = [
     (
         "Your Bedrock spend is at *${spend}* today — about 70% of the ${limit} daily limit. "
-        "Claude Opus, Sonnet, and Haiku all remain available. This is just a heads-up."
+        + "Claude Opus, Sonnet, and Haiku all remain available. This is just a heads-up."
     ),
     (
         "Heads-up: your Bedrock spend has reached *${spend}*, roughly 70% of today's ${limit} limit. "
-        "Claude Opus, Sonnet, and Haiku are still fully available."
+        + "Claude Opus, Sonnet, and Haiku are still fully available."
     ),
     (
         "Your Bedrock usage has crossed 70% of the daily limit — *${spend}* of ${limit} so far. "
-        "No models have been restricted yet."
+        + "No models have been restricted yet."
     ),
 ]
 
 _T1_MESSAGES = [
     (
         "Your Bedrock spend has reached *${spend}*, crossing the 80% threshold. Claude Opus has "
-        "been disabled for the rest of the day. Claude Sonnet and Haiku remain available. "
-        "Access resets at 0400 UTC."
+        + "been disabled for the rest of the day. Claude Sonnet and Haiku remain available. "
+        + "Access resets at 0400 UTC."
     ),
     (
         "At *${spend}* today, your Bedrock usage has hit the 80% threshold and Claude Opus is now "
-        "unavailable until the daily reset at 0400 UTC. Claude Sonnet and Haiku are unaffected."
+        + "unavailable until the daily reset at 0400 UTC. Claude Sonnet and Haiku are unaffected."
     ),
     (
         "Claude Opus has been withdrawn for the remainder of the day — your spend reached *${spend}*. "
-        "Claude Sonnet and Haiku remain in service. The limit resets at 0400 UTC."
+        + "Claude Sonnet and Haiku remain in service. The limit resets at 0400 UTC."
     ),
 ]
 
 _T2_MESSAGES = [
     (
         "Your Bedrock spend has reached the daily limit of *${spend}*. Claude Opus and Sonnet have "
-        "both been disabled until the reset at 0400 UTC. Claude Haiku remains available."
+        + "both been disabled until the reset at 0400 UTC. Claude Haiku remains available."
     ),
     (
         "The daily Bedrock limit has been reached — *${spend}* today. Claude Opus and Sonnet are "
-        "unavailable for the rest of the day. Claude Haiku remains in service. Access resets at "
-        "0400 UTC."
+        + "unavailable for the rest of the day. Claude Haiku remains in service. Access resets at "
+        + "0400 UTC."
     ),
     (
         "You've reached today's Bedrock limit (*${spend}*). Claude Opus and Sonnet are now disabled "
-        "until 0400 UTC. Claude Haiku is still available."
+        + "until 0400 UTC. Claude Haiku is still available."
     ),
 ]
 

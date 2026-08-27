@@ -8,6 +8,17 @@ Description: >
 Resources:
   StateTable:
     Type: AWS::DynamoDB::Table
+    # checkov:skip=CKV_AWS_119:Uses DynamoDB default encryption at rest; a customer-managed KMS CMK is out of scope for this single-account reference sample.
+    # checkov:skip=CKV_AWS_28:Per-user daily spend state resets at the 0400 UTC boundary and is re-derivable from Bedrock logs; point-in-time recovery is out of scope for this sample.
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit table name is referenced by the Lambda environment variables and across stacks; the no-in-place-replacement tradeoff is acceptable for this reference sample."
+          - id: W74
+            reason: "Uses DynamoDB default encryption at rest; a customer-managed KMS CMK is out of scope for this single-account reference sample."
+          - id: W78
+            reason: "Per-user daily spend state resets each day and is re-derivable from Bedrock logs; point-in-time recovery is out of scope for this sample."
     Properties:
       TableName: bedrock-spend-enforcement-state
       BillingMode: PAY_PER_REQUEST
@@ -20,6 +31,17 @@ Resources:
 
   ExceptionsTable:
     Type: AWS::DynamoDB::Table
+    # checkov:skip=CKV_AWS_119:Uses DynamoDB default encryption at rest; a customer-managed KMS CMK is out of scope for this single-account reference sample.
+    # checkov:skip=CKV_AWS_28:Exceptions are manually created via the Slack admin command and easily re-created; point-in-time recovery is out of scope for this sample.
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit table name is referenced by the Lambda environment variables and across stacks; the no-in-place-replacement tradeoff is acceptable for this reference sample."
+          - id: W74
+            reason: "Uses DynamoDB default encryption at rest; a customer-managed KMS CMK is out of scope for this single-account reference sample."
+          - id: W78
+            reason: "Exceptions are manually created and easily re-created; point-in-time recovery is out of scope for this sample."
     Properties:
       TableName: bedrock-spend-enforcement-exceptions
       BillingMode: PAY_PER_REQUEST
