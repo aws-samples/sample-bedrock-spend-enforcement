@@ -101,12 +101,26 @@ Resources:
 
   ViewManagerLogGroup:
     Type: AWS::Logs::LogGroup
+    # checkov:skip=CKV_AWS_158:Log group uses default CloudWatch Logs encryption at rest; a customer-managed KMS key is out of scope for this single-account reference sample.
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "Log group uses default CloudWatch Logs encryption at rest; a customer-managed KMS key is out of scope for this reference sample."
     Properties:
       LogGroupName: /aws/lambda/bedrock-spend-enforcement-view-manager
       RetentionInDays: 30
 
   ViewManagerRole:
     Type: AWS::IAM::Role
+    # checkov:skip=CKV_AWS_111:Athena/Glue actions used to create/update/delete the cost view do not support resource-level ARNs; all ARN-scopable actions are already scoped to specific resources.
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit role name keeps the execution role ARN stable; acceptable for this reference sample."
+          - id: W11
+            reason: "Athena/Glue actions used to create/update/delete the cost view do not support resource-level ARNs; all ARN-scopable actions are already scoped to specific resources."
     Properties:
       RoleName: bedrock-spend-enforcement-view-manager
       AssumeRolePolicyDocument:
@@ -165,6 +179,19 @@ Resources:
     DependsOn:
       - LogsTable
       - ViewManagerLogGroup
+    # checkov:skip=CKV_AWS_115:One-shot CloudFormation custom resource that creates the Athena view at deploy time; a reserved-concurrency cap is unnecessary.
+    # checkov:skip=CKV_AWS_117:Function calls Athena/Glue service APIs over the internet; VPC deployment would require NAT/VPC endpoints beyond the scope of this reference sample.
+    # checkov:skip=CKV_AWS_116:One-shot custom resource invoked synchronously by CloudFormation; a dead-letter queue does not apply.
+    # checkov:skip=CKV_AWS_173:Environment variables use Lambda default encryption at rest; a customer-managed KMS key is out of scope for this reference sample.
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit function name keeps the log group and ARN stable; acceptable for this reference sample."
+          - id: W89
+            reason: "Function calls Athena/Glue service APIs over the internet; VPC deployment would require NAT/VPC endpoints beyond the scope of this reference sample."
+          - id: W92
+            reason: "One-shot CloudFormation custom resource run only at deploy time; a reserved-concurrency cap is unnecessary."
     Properties:
       FunctionName: bedrock-spend-enforcement-view-manager
       Runtime: python3.12

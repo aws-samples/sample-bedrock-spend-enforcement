@@ -64,6 +64,13 @@ Resources:
 
   AthenaResultsBucketResource:
     Type: AWS::S3::Bucket
+    # checkov:skip=CKV_AWS_21:Bucket holds only ephemeral Athena result CSVs with a 7-day expiry; versioning would retain obsolete results and conflict with the lifecycle expiry.
+    # checkov:skip=CKV_AWS_18:Access logging on a transient results bucket adds cost with no audit benefit for this reference sample.
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: "Bucket holds only ephemeral Athena result CSVs (7-day expiry); S3 access logging adds cost with no audit benefit for this reference sample."
     Properties:
       BucketName: !Sub bedrock-spend-enforcement-athena-results-${AWS::AccountId}
       PublicAccessBlockConfiguration:
@@ -109,6 +116,14 @@ Resources:
 
   LambdaExecutionRole:
     Type: AWS::IAM::Role
+    # checkov:skip=CKV_AWS_111:Athena/Glue read actions and cloudwatch:PutMetricData do not support resource-level ARNs (PutMetricData is constrained by a namespace condition); every ARN-scopable write action is already restricted to the two BedrockEnforcement policies and the two DynamoDB tables.
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit role name keeps the execution role ARN stable for cross-stack references; the no-in-place-replacement tradeoff is acceptable for this reference sample."
+          - id: W11
+            reason: "Athena/Glue read actions and cloudwatch:PutMetricData do not support resource-level ARNs (PutMetricData is scoped by a namespace condition); all ARN-scopable actions are already scoped to specific resources."
     Properties:
       RoleName: bedrock-spend-enforcement-lambda
       AssumeRolePolicyDocument:
@@ -210,6 +225,12 @@ Resources:
   # this app, all of which are already set to 30 days.
   EnforcementLambdaLogGroup:
     Type: AWS::Logs::LogGroup
+    # checkov:skip=CKV_AWS_158:Log group uses default CloudWatch Logs encryption at rest; a customer-managed KMS key is out of scope for this single-account reference sample.
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "Log group uses default CloudWatch Logs encryption at rest; a customer-managed KMS key is out of scope for this reference sample."
     Properties:
       LogGroupName: /aws/lambda/bedrock-spend-enforcement
       RetentionInDays: 30
@@ -217,6 +238,16 @@ Resources:
   EnforcementLambda:
     Type: AWS::Lambda::Function
     DependsOn: EnforcementLambdaLogGroup
+    # checkov:skip=CKV_AWS_117:Function calls AWS service APIs and the Slack API over the internet; VPC deployment would require NAT/VPC endpoints beyond the scope of this reference sample.
+    # checkov:skip=CKV_AWS_116:The enforcement loop is idempotent and re-runs every 15 minutes on schedule, so a dead-letter queue adds no value.
+    # checkov:skip=CKV_AWS_173:Environment variables use Lambda default encryption at rest; a customer-managed KMS key is out of scope for this reference sample.
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit function name keeps the log group and ARN stable for cross-stack references; acceptable for this reference sample."
+          - id: W89
+            reason: "Function calls AWS service APIs and the Slack API over the internet; VPC deployment would require NAT/VPC endpoints beyond the scope of this reference sample."
     Properties:
       FunctionName: bedrock-spend-enforcement
       Runtime: python3.12
@@ -247,6 +278,11 @@ Resources:
 
   Every15MinTrigger:
     Type: AWS::Events::Rule
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit rule name is intentional for a predictable, discoverable schedule in this reference sample."
     Properties:
       Name: bedrock-spend-enforcement-every-15min
       ScheduleExpression: cron(0/15 * * * ? *)
@@ -272,6 +308,11 @@ Resources:
 
   PolicySizeAlarmTopic:
     Type: AWS::SNS::Topic
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit topic name is intentional so operators can find and subscribe to the alarm topic; acceptable for this reference sample."
     Properties:
       TopicName: bedrock-spend-enforcement-policy-size-alarm
       KmsMasterKeyId: alias/aws/sns
@@ -290,6 +331,11 @@ Resources:
   # fires on the first occurrence.
   PolicySizeCeilingAlarm:
     Type: AWS::CloudWatch::Alarm
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit alarm name is intentional for a predictable, discoverable alarm in this reference sample."
     Properties:
       AlarmName: bedrock-spend-enforcement-policy-size-ceiling
       AlarmDescription: >

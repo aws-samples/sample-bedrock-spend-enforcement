@@ -59,6 +59,11 @@ Resources:
 
   SlashCommandRole:
     Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit role name keeps the execution role ARN stable for cross-stack references; acceptable for this reference sample."
     Properties:
       RoleName: bedrock-spend-enforcement-slash-command
       AssumeRolePolicyDocument:
@@ -101,6 +106,19 @@ Resources:
   SlashCommandLambda:
     Type: AWS::Lambda::Function
     DependsOn: SlashCommandLogGroup
+    # checkov:skip=CKV_AWS_115:Concurrency is managed via provisioned concurrency on the "live" alias below rather than a reserved-concurrency cap on the function.
+    # checkov:skip=CKV_AWS_117:Function calls AWS service APIs and the Slack API over the internet; VPC deployment would require NAT/VPC endpoints beyond the scope of this reference sample.
+    # checkov:skip=CKV_AWS_116:Function responds synchronously to Slack slash-command requests; a dead-letter queue does not apply to this request/response path.
+    # checkov:skip=CKV_AWS_173:Environment variables use Lambda default encryption at rest; a customer-managed KMS key is out of scope for this reference sample.
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit function name keeps the log group and ARN stable for cross-stack references; acceptable for this reference sample."
+          - id: W89
+            reason: "Function calls AWS service APIs and the Slack API over the internet; VPC deployment would require NAT/VPC endpoints beyond the scope of this reference sample."
+          - id: W92
+            reason: "Concurrency is managed via provisioned concurrency on the live alias rather than a reserved-concurrency cap; a reserved cap would defeat the warm-alias design documented below."
     Properties:
       FunctionName: bedrock-spend-enforcement-slash-command
       Runtime: python3.12
@@ -208,12 +226,24 @@ Resources:
   # in sync as long as the function name doesn't change.
   SlashCommandLogGroup:
     Type: AWS::Logs::LogGroup
+    # checkov:skip=CKV_AWS_158:Log group uses default CloudWatch Logs encryption at rest; a customer-managed KMS key is out of scope for this single-account reference sample.
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "Log group uses default CloudWatch Logs encryption at rest; a customer-managed KMS key is out of scope for this reference sample."
     Properties:
       LogGroupName: /aws/lambda/bedrock-spend-enforcement-slash-command
       RetentionInDays: 30
 
   SlashCommandApiLogGroup:
     Type: AWS::Logs::LogGroup
+    # checkov:skip=CKV_AWS_158:Log group uses default CloudWatch Logs encryption at rest; a customer-managed KMS key is out of scope for this single-account reference sample.
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "Log group uses default CloudWatch Logs encryption at rest; a customer-managed KMS key is out of scope for this reference sample."
     Properties:
       LogGroupName: /aws/apigateway/bedrock-spend-enforcement-slash-command
       RetentionInDays: 30
