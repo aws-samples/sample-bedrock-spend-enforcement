@@ -492,6 +492,7 @@ place — cross-referenced to where else in this README each one is explained.
 | IAM policy size alarm thresholds (80%/95% of the 6,144-byte cap) | `lambda/handler.py`, `POLICY_SIZE_WARN_RATIO` / `POLICY_SIZE_CRITICAL_RATIO` | See the `PolicySizeOverflow` note in [Troubleshooting](#troubleshooting) |
 
 ## Getting help
+We are here to help and if you need further assistance, reach out to AWS Support and your AWS account team.
 
 Open an issue on this repository's [GitHub Issues](https://github.com/aws-samples/sample-bedrock-spend-enforcement/issues) page.
 
