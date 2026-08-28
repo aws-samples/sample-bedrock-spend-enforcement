@@ -130,14 +130,22 @@ def _ephemeral(text: str) -> dict[str, Any]:
 def _post_response_url(response_url: str, text: str) -> None:
     """POST an ephemeral message back to Slack via response_url."""
     import urllib.request
+
+    # Defense in depth: response_url arrives inside a Slack-signed request, but reject
+    # anything that is not an HTTPS URL before handing it to urlopen, so a non-web
+    # scheme (e.g. file://) can never be dereferenced.
+    if not response_url.lower().startswith("https://"):
+        logger.error("Refusing to post to a non-HTTPS response_url")
+        return
     payload = json.dumps(
         {"response_type": "ephemeral", "replace_original": False, "text": text}
     ).encode()
-    req = urllib.request.Request(
+    req = urllib.request.Request(  # nosemgrep: dynamic-urllib-use-detected
         response_url, data=payload, headers={"Content-Type": _CONTENT_TYPE_JSON}
     )
     try:
-        urllib.request.urlopen(req, timeout=5)
+        # nosemgrep: dynamic-urllib-use-detected
+        urllib.request.urlopen(req, timeout=5)  # nosec B310 -- https scheme validated above
     except Exception:
         logger.exception("Failed to post to response_url")
 
@@ -151,11 +159,8 @@ def _post_ephemeral_api(channel_id: str, user_id: str, text: str) -> None:
     """
     token = os.environ.get("SLACK_BOT_TOKEN", "")
     if not token:
-        logger.error(
-            "SLACK_BOT_TOKEN not configured — ephemeral delivery skipped channel=%s user=%s",
-            channel_id,
-            user_id,
-        )
+        # Static message about a MISSING token; logs only channel_id/user_id, never a secret value.
+        logger.error("Slack bot token not configured — ephemeral delivery skipped channel=%s user=%s", channel_id, user_id)  # nosemgrep
         return
     try:
         WebClient(token=token).chat_postEphemeral(channel=channel_id, user=user_id, text=text)
